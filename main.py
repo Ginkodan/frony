@@ -40,6 +40,7 @@ class FronePhone:
 
         self._running = False
         self._timeout_thread: Optional[threading.Thread] = None
+        self._peer_status: dict = {}
 
         # Wire up callbacks
         self._setup_callbacks()
@@ -52,6 +53,7 @@ class FronePhone:
         # MQTT callbacks
         self.mqtt.set_on_call_request(self._on_call_request)
         self.mqtt.set_on_call_response(self._on_call_response)
+        self.mqtt.set_on_status_update(self._on_peer_status)
 
         # GPIO callbacks
         self.gpio.set_on_call_button(self._on_call_button)
@@ -104,6 +106,7 @@ class FronePhone:
         elif new_state == CallState.CALLING:
             self.gpio.start_blinking("call", 0.3)  # Fast blink while calling
             self.mqtt.publish_status("busy")
+            self.audio.start_ringback()
 
         elif new_state == CallState.RINGING:
             self.gpio.start_blinking("ring", 0.5)  # Blink ring LED
@@ -125,6 +128,24 @@ class FronePhone:
             # Already busy, send busy response
             self.mqtt.send_call_response(from_id, "busy")
 
+    def _on_peer_status(self, peer_id: str, status: str):
+        """Track peer online/offline/busy status from MQTT retained messages."""
+        self._peer_status[peer_id] = status
+        logger.debug(f"Peer status: {peer_id} = {status}")
+
+    def _can_call(self, target_id: str) -> bool:
+        """Check peer status before dialing. Plays busy tone and returns False if unreachable."""
+        status = self._peer_status.get(target_id)
+        if status in ("offline", None) and status is not None:
+            logger.info(f"Cannot call {target_id}: {status}")
+            self.audio.start_busy_tone()
+            return False
+        if status == "busy":
+            logger.info(f"Cannot call {target_id}: busy")
+            self.audio.start_busy_tone()
+            return False
+        return True
+
     def _on_call_response(self, from_id: str, response_type: str, port: Optional[int], from_ip: Optional[str] = None):
         """Handle call response from MQTT."""
         if response_type == "accept":
@@ -138,18 +159,25 @@ class FronePhone:
         elif response_type == "reject":
             logger.info(f"Call rejected by {from_id}")
             self.state_machine.call_rejected()
+            self.audio.start_busy_tone()
 
         elif response_type == "hangup":
+            was_in_call = self.state_machine.state == CallState.IN_CALL
             logger.info(f"Remote hangup from {from_id}")
             self.state_machine.hangup()
+            if was_in_call:
+                self.audio.play_disconnect_tone()
 
         elif response_type == "busy":
             logger.info(f"{from_id} is busy")
             self.state_machine.call_rejected()
+            self.audio.start_busy_tone()
 
     def _on_call_button(self, target_id: str):
         """Handle call button press from GPIO."""
         if self.state_machine.state == CallState.IDLE:
+            if not self._can_call(target_id):
+                return
             if self.state_machine.start_call(target_id):
                 self.mqtt.send_call_request(target_id)
         else:
@@ -162,6 +190,8 @@ class FronePhone:
         if state == CallState.IDLE:
             # Initiate call to default contact
             target_id = config.DEFAULT_CONTACT
+            if not self._can_call(target_id):
+                return
             if self.state_machine.start_call(target_id):
                 self.mqtt.send_call_request(target_id)
 
@@ -206,6 +236,7 @@ class FronePhone:
                 if peer_id:
                     self.mqtt.send_call_response(peer_id, "hangup")
                 self.state_machine.call_timeout()
+                self.audio.start_busy_tone()  # No answer
 
             elif state == CallState.RINGING and duration > config.RING_TIMEOUT:
                 logger.info("Incoming call timed out")

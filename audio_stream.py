@@ -8,6 +8,7 @@ Uses raw PCM audio (16kHz, 16-bit, mono) over UDP.
 import socket
 import threading
 import logging
+import time
 from collections import deque
 from typing import Optional
 
@@ -199,28 +200,74 @@ class AudioStreamer:
                 self._output_stream.stop()
 
     def start_ringtone(self):
-        """Play a ringing tone (2s on / 4s off) until stopped."""
-        if self._ringtone_running:
-            return
-        self._ringtone_running = True
-        self._ringtone_thread = threading.Thread(target=self._ringtone_loop, daemon=True)
-        self._ringtone_thread.start()
+        """Play a ringing tone (440+480 Hz, 2s on / 4s off) until stopped."""
+        self._start_tone(on_secs=2.0, off_secs=4.0, freqs=(440, 480))
+
+    def start_ringback(self):
+        """Play ringback (440+480 Hz, 1s on / 3s off) while waiting for answer."""
+        self._start_tone(on_secs=1.0, off_secs=3.0, freqs=(440, 480))
+
+    def start_busy_tone(self):
+        """Play fast busy signal (480+620 Hz, 0.5s on / 0.5s off) for ~6 seconds."""
+        self._start_tone(on_secs=0.5, off_secs=0.5, freqs=(480, 620), auto_stop_secs=6.0)
 
     def stop_ringtone(self):
-        """Stop the ringtone."""
+        """Stop any active looping tone."""
         self._ringtone_running = False
         if self._ringtone_thread:
             self._ringtone_thread.join(timeout=2.0)
             self._ringtone_thread = None
 
-    def _ringtone_loop(self):
-        """Generate and play a standard two-tone telephone ring (440 + 480 Hz)."""
+    def play_disconnect_tone(self):
+        """Play a brief one-shot disconnect sound (non-blocking)."""
+        def _play():
+            sr = config.SAMPLE_RATE
+            chunk = config.CHUNK_SAMPLES
+            t = np.linspace(0, 0.2, int(0.2 * sr), endpoint=False)
+            tone = (np.sin(2 * np.pi * 480 * t) * 12000).astype(np.int16)
+            try:
+                stream = sd.OutputStream(
+                    samplerate=sr, channels=1, dtype=np.int16,
+                    blocksize=chunk, device=config.AUDIO_DEVICE,
+                )
+                stream.start()
+                try:
+                    for i in range(0, len(tone), chunk):
+                        frame = tone[i:i + chunk]
+                        if len(frame) < chunk:
+                            frame = np.pad(frame, (0, chunk - len(frame)))
+                        stream.write(frame.reshape(-1, 1))
+                finally:
+                    stream.stop()
+                    stream.close()
+            except Exception as e:
+                logger.error(f"Disconnect tone error: {e}")
+
+        threading.Thread(target=_play, daemon=True).start()
+
+    def _start_tone(self, on_secs: float, off_secs: float,
+                    freqs: tuple = (440, 480), auto_stop_secs: float = None):
+        if self._ringtone_running:
+            return
+        self._ringtone_running = True
+        self._ringtone_thread = threading.Thread(
+            target=self._tone_loop, args=(on_secs, off_secs, freqs, auto_stop_secs), daemon=True
+        )
+        self._ringtone_thread.start()
+
+    def _tone_loop(self, on_secs: float, off_secs: float,
+                   freqs: tuple, auto_stop_secs: float):
+        """Generate and play a multi-frequency telephone tone."""
         sr = config.SAMPLE_RATE
         chunk = config.CHUNK_SAMPLES
 
-        t = np.linspace(0, 2.0, int(2.0 * sr), endpoint=False)
-        tone = ((np.sin(2 * np.pi * 440 * t) + np.sin(2 * np.pi * 480 * t)) / 2 * 16000).astype(np.int16)
-        silence_total = int(4.0 * sr)
+        t = np.linspace(0, on_secs, int(on_secs * sr), endpoint=False)
+        tone = sum(np.sin(2 * np.pi * f * t) for f in freqs)
+        tone = (tone / len(freqs) * 16000).astype(np.int16)
+
+        silence_chunks = int(off_secs * sr) // chunk
+        silence_frame = np.zeros((chunk, 1), dtype=np.int16)
+        deadline = (time.time() + auto_stop_secs) if auto_stop_secs else None
 
         try:
             stream = sd.OutputStream(
@@ -230,7 +277,8 @@ class AudioStreamer:
             stream.start()
             try:
                 while self._ringtone_running:
-                    # 2s ring
+                    if deadline and time.time() >= deadline:
+                        break
                     for i in range(0, len(tone), chunk):
                         if not self._ringtone_running:
                             break
@@ -238,9 +286,7 @@ class AudioStreamer:
                         if len(frame) < chunk:
                             frame = np.pad(frame, (0, chunk - len(frame)))
                         stream.write(frame.reshape(-1, 1))
-                    # 4s silence
-                    silence_frame = np.zeros((chunk, 1), dtype=np.int16)
-                    for _ in range(silence_total // chunk):
+                    for _ in range(silence_chunks):
                         if not self._ringtone_running:
                             break
                         stream.write(silence_frame)
@@ -248,7 +294,9 @@ class AudioStreamer:
                 stream.stop()
                 stream.close()
         except Exception as e:
-            logger.error(f"Ringtone error: {e}")
+            logger.error(f"Tone error: {e}")
+        finally:
+            self._ringtone_running = False
 
 
 # Standalone test mode

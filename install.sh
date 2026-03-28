@@ -115,13 +115,31 @@ echo ""
 echo "[5/6] Setting up Python environment..."
 cd "$SCRIPT_DIR"
 
+# Pick the best Python version — piwheels has prebuilt wheels for 3.11/3.12
+# but not 3.13 yet, so prefer older versions to avoid compiling from source.
+if command -v python3.11 &>/dev/null; then
+    PYTHON=python3.11
+elif command -v python3.12 &>/dev/null; then
+    PYTHON=python3.12
+else
+    PYTHON=python3
+fi
+echo "Using $($PYTHON --version)"
+
 # Create virtual environment
-python3 -m venv venv
+$PYTHON -m venv venv
 source venv/bin/activate
 
 # Install Python packages
 pip install --upgrade pip
-pip install -r requirements.txt
+
+if [ -d "$SCRIPT_DIR/wheels" ] && [ -n "$(ls "$SCRIPT_DIR/wheels"/*.whl 2>/dev/null)" ]; then
+    echo "Installing from prebuilt wheels..."
+    pip install --no-index --find-links="$SCRIPT_DIR/wheels" -r requirements.txt
+else
+    echo "No prebuilt wheels found, installing from PyPI/piwheels (may take a while)..."
+    pip install --prefer-binary -r requirements.txt
+fi
 
 deactivate
 
