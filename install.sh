@@ -32,6 +32,13 @@ fi
 echo "Detected boot config: $BOOT_CONFIG"
 
 echo "[1/6] Updating system packages..."
+
+# Wait for any background apt/packagekit process to release the lock
+while fuser /var/lib/apt/lists/lock /var/lib/dpkg/lock-frontend &>/dev/null; do
+    echo "Waiting for apt lock to be released..."
+    sleep 3
+done
+
 apt-get update
 apt-get upgrade -y
 
