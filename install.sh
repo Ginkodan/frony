@@ -164,6 +164,14 @@ fi
 chown -R root:frone "$SCRIPT_DIR"
 chmod -R g+rX "$SCRIPT_DIR"
 
+# Ensure all parent directories are traversable by the service user
+# (home directories are often 700 which blocks system users)
+DIR="$SCRIPT_DIR"
+while [ "$DIR" != "/" ]; do
+    DIR="$(dirname "$DIR")"
+    chmod o+x "$DIR"
+done
+
 sed "s|__INSTALL_DIR__|$SCRIPT_DIR|g" frone.service > /etc/systemd/system/frone.service
 systemctl daemon-reload
 systemctl enable frone
